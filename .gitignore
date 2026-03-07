@@ -1,0 +1,14 @@
+# Exclude large data files
+*.npy
+*.json
+
+# Exclude dataset directories
+Datasets/
+
+# Exclude research repositories (sub-folders) if needed
+Comment-Robert/
+2022.0287/
+
+# Exclude environment locks or local configs
+.gemini/
+.agent/
