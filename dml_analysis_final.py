@@ -52,12 +52,23 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
     
     post_map = {}
     mblogid_to_id = {}
+    valid_pids = set()
     for p in posts_data:
         pid = p['_id']
+        content = p.get('content', '')
+        if '//@评论罗伯特' in content:
+            idx = content.find('//@评论罗伯特')
+            if '@评论罗伯特' not in content[:idx]:
+                continue
+        valid_pids.add(pid)
         if pid in post_ids:
             post_map[pid] = {'likes_count': p.get('likes_count', 0), 'user_id': p.get('user', {}).get('_id')}
             if p.get('mblogid'):
                 mblogid_to_id[p.get('mblogid')] = pid
+
+    valid_indices = [i for i, pid in enumerate(mapping_order) if pid in valid_pids]
+    mapping_order = mapping_order[valid_indices]
+    embeddings = embeddings[valid_indices]
 
     print_flush(f"Loading Users.json ({users_path})...")
     with open(users_path, 'r', encoding='utf-8') as f:
