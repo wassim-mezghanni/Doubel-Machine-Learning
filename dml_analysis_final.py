@@ -150,7 +150,9 @@ def train_vae(data, epochs=10):
     loader = DataLoader(TensorDataset(torch.FloatTensor(data)), batch_size=256, shuffle=True)
     print_flush("Training VAE...")
     model.train()
+    final_loss = 0.0
     for epoch in range(epochs):
+        epoch_loss = 0.0
         for (x,) in loader:
             x = x.to(device)
             optimizer.zero_grad()
@@ -158,10 +160,12 @@ def train_vae(data, epochs=10):
             loss = vae_loss_function(recon, x, mu, logvar)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+        final_loss = epoch_loss / len(loader.dataset)
     model.eval()
     with torch.no_grad():
         mu, _ = model.encode(torch.FloatTensor(data).to(device))
-    return mu.cpu().numpy()
+    return mu.cpu().numpy(), final_loss
 
 class BranchModel(nn.Module):
     def __init__(self, text_dim=100, user_dim=10, output_type='regression'):
@@ -218,7 +222,7 @@ def run_dml_analysis():
     
     print_flush(f"Class Balance (RobReplied): {np.mean(rob_replied):.4f}")
     
-    latents = train_vae(emb)
+    latents, vae_loss = train_vae(emb)
     
     res_likes = train_and_get_residuals(latents, u_feat, ln_likes, 'regression')
     res_rob = train_and_get_residuals(latents, u_feat, rob_replied, 'classification')
@@ -238,6 +242,7 @@ def run_dml_analysis():
     print_flush(m2.summary().as_text())
     
     results = {
+        "vae_loss": vae_loss,
         "model1": {"coef": m1.params.tolist(), "pvalues": m1.pvalues.tolist(), "r2": m1.rsquared},
         "model2": {"coef": m2.params.tolist(), "pvalues": m2.pvalues.tolist(), "r2": m2.rsquared},
         "residuals": {"res_likes": res_likes.tolist(), "res_rob": res_rob.tolist(), "res_female_rob": res_female_rob.tolist()}
