@@ -26,16 +26,11 @@ def preprocess_user_features(user_data):
     feats = [
         float(user_data.get('followers_count', 0)),
         float(user_data.get('friends_count', 0)),
-        float(user_data.get('statuses_count', 0)),
         float(user_data.get('mbrank', 0)),
-        float(user_data.get('mbtype', 0)),
         float(credit_map.get(user_data.get('sunshine_credit', '信用一般'), 2)),
-        1.0 if user_data.get('verified', False) else 0.0,
-        1.0 if user_data.get('gender', 'f') == 'm' else 0.0,
-        float(len(user_data.get('location', ''))),
         float(len(user_data.get('label_desc', [])))
     ]
-    return np.array(feats)
+    return feats
 
 def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path, embeddings_path):
     print_flush("Loading final data mapping...")
@@ -62,7 +57,13 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
                 continue
         valid_pids.add(pid)
         if pid in post_ids:
-            post_map[pid] = {'likes_count': p.get('likes_count', 0), 'user_id': p.get('user', {}).get('_id')}
+            post_map[pid] = {
+                'likes_count': p.get('likes_count', 0),
+                'comments_count': p.get('comments_count', 0),
+                'created_at': p.get('created_at', ''),
+                'ip_location': p.get('ip_location', 'Unknown'),
+                'user_id': p.get('user', {}).get('_id')
+            }
             if p.get('mblogid'):
                 mblogid_to_id[p.get('mblogid')] = pid
 
@@ -76,7 +77,6 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
     user_map = {u['_id']: u for u in users_raw}
     
     print_flush(f"Inference: Searching for Robot Replies in {comments_path}...")
-    # Using a slightly more manual scan to potentially save memory if json.load fails for 1.4GB
     rob_replied_ids = set()
     with open(comments_path, 'r', encoding='utf-8') as f:
         try:
@@ -87,20 +87,18 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
                     if mbid in mblogid_to_id:
                         rob_replied_ids.add(mblogid_to_id[mbid])
         except MemoryError:
-            print_flush("Memory Error during JSON load. Falling back to manual line-by-line scan (pseudo-JSONL)...")
-            # Fallback if the system can't handle 1.4GB in json.load
-            # This is complex for actual JSON, but usually we can search for ROBOT_ID string
-            # and then find the mblogid if it's in the same block.
+            print_flush("Memory Error... falling back.")
             pass
 
-    aligned_likes, aligned_user_features, aligned_rob_replied, aligned_gender = [], [], [], []
+    aligned_likes, aligned_comments, aligned_user_features, aligned_rob_replied, aligned_gender = [], [], [], [], []
+    aligned_ip_locations = []
     
     print_flush(f"Aligning {len(mapping_order)} samples...")
     for pid in mapping_order:
-        p_info = post_map.get(pid, {'likes_count': 0, 'user_id': None})
-        aligned_likes.append(p_info['likes_count'])
+        p_info = post_map.get(pid, {})
+        u_info = user_map.get(p_info.get('user_id'), {})
         
-        u_info = user_map.get(p_info['user_id'], {})
+        # Base features
         u_feat = preprocess_user_features(u_info)
         aligned_user_features.append(u_feat)
         
@@ -110,9 +108,32 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
         gender_val = 1.0 if u_info.get('gender', 'f') == 'f' else 0.0
         aligned_gender.append(gender_val)
         
-    return embeddings, np.array(aligned_user_features), np.array(aligned_likes), np.array(aligned_rob_replied), np.array(aligned_gender), mapping_order
-
-# --- VAE & Branch Models ( with bias) ---
+        aligned_likes.append(p_info.get('likes_count', 0))
+        
+        c_count = p_info.get('comments_count', 0)
+        if is_rob > 0.5:
+            c_count = max(0, c_count - 1)
+        aligned_comments.append(c_count)
+        
+        ip = str(p_info.get('ip_location', 'Unknown')).strip()
+        aligned_ip_locations.append(ip if ip else 'Unknown')
+        
+    print_flush("Processing time and IP dummies...")
+    p_times = [post_map.get(pid, {}).get('created_at', '2020-01-01 00:00:00') for pid in mapping_order]
+    u_times = [user_map.get(post_map.get(pid, {}).get('user_id'), {}).get('created_at', '2020-01-01 00:00:00') for pid in mapping_order]
+    
+    p_dates = pd.to_datetime(p_times, errors='coerce').fillna(pd.Timestamp('2020-01-01 00:00:00'))
+    u_dates = pd.to_datetime(u_times, errors='coerce').fillna(pd.Timestamp('2020-01-01 00:00:00'))
+    aligned_account_ages = (p_dates - u_dates).total_seconds().to_numpy() / 86400.0
+    
+    ip_dummies = pd.get_dummies(aligned_ip_locations, prefix='ip', dummy_na=False).values.astype(float)
+    
+    u_feat_matrix = np.array(aligned_user_features)
+    age_matrix = aligned_account_ages.reshape(-1, 1)
+    
+    final_features = np.hstack([u_feat_matrix, age_matrix, ip_dummies])
+    
+    return embeddings, final_features, np.array(aligned_likes), np.array(aligned_comments), np.array(aligned_rob_replied), np.array(aligned_gender), mapping_order
 
 class VAE(nn.Module):
     def __init__(self, input_dim=1024, hidden_dim=512, latent_dim=100):
@@ -209,7 +230,7 @@ def run_dml_analysis():
     BASE_DIR = r"c:\Users\ge27tuv\Projects\Doubel-Machine-Learning"
     DATA_DIR = os.path.join(BASE_DIR, "Datasets")
     
-    emb, u_feat, likes, rob_replied, gender, ids = load_and_align_full_data(
+    emb, u_feat, likes, comments, rob_replied, gender, ids = load_and_align_full_data(
         os.path.join(DATA_DIR, "id_mapping_final.csv"),
         os.path.join(DATA_DIR, "Posts.json"),
         os.path.join(DATA_DIR, "Users.json"),
@@ -218,34 +239,76 @@ def run_dml_analysis():
     )
     
     ln_likes = np.log1p(likes)
+    ln_comments = np.log1p(comments)
     female_rob = gender * rob_replied
     
     print_flush(f"Class Balance (RobReplied): {np.mean(rob_replied):.4f}")
+    print_flush(f"Total features per sample: {u_feat.shape[1]}")
     
     latents, vae_loss = train_vae(emb)
     
+    # Base residuals
     res_likes = train_and_get_residuals(latents, u_feat, ln_likes, 'regression')
+    res_comments = train_and_get_residuals(latents, u_feat, ln_comments, 'regression')
+    
+    # Treatment & interaction residuals
     res_rob = train_and_get_residuals(latents, u_feat, rob_replied, 'classification')
+    res_female = train_and_get_residuals(latents, u_feat, gender, 'classification')
     res_female_rob = train_and_get_residuals(latents, u_feat, female_rob, 'regression')
     
     print_flush("\n--- Final OLS Regressions ---")
-    # Model 1
+    
+    # Baseline Model 1
     X1 = sm.add_constant(res_rob)
     m1 = sm.OLS(res_likes, X1).fit()
     print_flush("Model 1: res_ln_likes ~ res_RobReplied")
     print_flush(m1.summary().as_text())
     
-    # Model 2
+    # Baseline Model 2
     X2 = sm.add_constant(np.column_stack([res_rob, res_female_rob]))
     m2 = sm.OLS(res_likes, X2).fit()
     print_flush("\nModel 2: res_ln_likes ~ res_RobReplied + res_female_RobReplied")
     print_flush(m2.summary().as_text())
     
+    # Additional Model 1: res_ln_likes ~ res_female
+    X_add1 = sm.add_constant(res_female)
+    m_add1 = sm.OLS(res_likes, X_add1).fit()
+    print_flush("\nAdd Model 1: res_ln_likes ~ res_female")
+    print_flush(m_add1.summary().as_text())
+    
+    # Additional Model 2: res_ln_likes ~ res_female + res_female_RobReplied
+    X_add2 = sm.add_constant(np.column_stack([res_female, res_female_rob]))
+    m_add2 = sm.OLS(res_likes, X_add2).fit()
+    print_flush("\nAdd Model 2: res_ln_likes ~ res_female + res_female_RobReplied")
+    print_flush(m_add2.summary().as_text())
+    
+    # Additional Model 3: res_ln_comments ~ res_female
+    X_add3 = sm.add_constant(res_female)
+    m_add3 = sm.OLS(res_comments, X_add3).fit()
+    print_flush("\nAdd Model 3: res_ln_comment_count ~ res_female")
+    print_flush(m_add3.summary().as_text())
+    
+    # Additional Model 4: res_ln_comments ~ res_female + res_female_RobReplied
+    X_add4 = sm.add_constant(np.column_stack([res_female, res_female_rob]))
+    m_add4 = sm.OLS(res_comments, X_add4).fit()
+    print_flush("\nAdd Model 4: res_ln_comment_count ~ res_female + res_female_RobReplied")
+    print_flush(m_add4.summary().as_text())
+    
     results = {
         "vae_loss": vae_loss,
         "model1": {"coef": m1.params.tolist(), "pvalues": m1.pvalues.tolist(), "r2": m1.rsquared},
         "model2": {"coef": m2.params.tolist(), "pvalues": m2.pvalues.tolist(), "r2": m2.rsquared},
-        "residuals": {"res_likes": res_likes.tolist(), "res_rob": res_rob.tolist(), "res_female_rob": res_female_rob.tolist()}
+        "add_model1": {"coef": m_add1.params.tolist(), "pvalues": m_add1.pvalues.tolist(), "r2": m_add1.rsquared},
+        "add_model2": {"coef": m_add2.params.tolist(), "pvalues": m_add2.pvalues.tolist(), "r2": m_add2.rsquared},
+        "add_model3": {"coef": m_add3.params.tolist(), "pvalues": m_add3.pvalues.tolist(), "r2": m_add3.rsquared},
+        "add_model4": {"coef": m_add4.params.tolist(), "pvalues": m_add4.pvalues.tolist(), "r2": m_add4.rsquared},
+        "residuals": {
+            "res_likes": res_likes.tolist(), 
+            "res_comments": res_comments.tolist(),
+            "res_rob": res_rob.tolist(), 
+            "res_female": res_female.tolist(),
+            "res_female_rob": res_female_rob.tolist()
+        }
     }
     with open(os.path.join(BASE_DIR, "dml_full_results.json"), "w") as f:
         json.dump(results, f)
