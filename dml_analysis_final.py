@@ -87,7 +87,7 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
                     if mbid in mblogid_to_id:
                         rob_replied_ids.add(mblogid_to_id[mbid])
         except MemoryError:
-            print_flush("Memory Error... falling back.")
+            print_flush("Memory Error... falling back scanned mode.")
             pass
 
     aligned_likes, aligned_comments, aligned_user_features, aligned_rob_replied, aligned_gender = [], [], [], [], []
@@ -133,7 +133,7 @@ def load_and_align_full_data(mapping_path, posts_path, users_path, comments_path
     
     final_features = np.hstack([u_feat_matrix, age_matrix, ip_dummies])
     
-    return embeddings, final_features, np.array(aligned_likes), np.array(aligned_comments), np.array(aligned_rob_replied), np.array(aligned_gender), mapping_order
+    return embeddings, final_features, np.array(aligned_likes), np.array(aligned_comments), np.array(aligned_rob_replied), np.array(aligned_gender), p_dates.values, mapping_order
 
 class VAE(nn.Module):
     def __init__(self, input_dim=1024, hidden_dim=512, latent_dim=100):
@@ -169,7 +169,7 @@ def train_vae(data, epochs=10):
     model = VAE(input_dim=data.shape[1]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     loader = DataLoader(TensorDataset(torch.FloatTensor(data)), batch_size=256, shuffle=True)
-    print_flush("Training VAE...")
+    print_flush("  Training VAE...")
     model.train()
     final_loss = 0.0
     for epoch in range(epochs):
@@ -204,7 +204,7 @@ def train_and_get_residuals(latents, u_feat, y_data, task_type):
     kf = KFold(n_splits=3, shuffle=True, random_state=42)
     residuals = np.zeros(len(y_data))
     for fold, (train_idx, val_idx) in enumerate(kf.split(latents)):
-        print_flush(f"  Fold {fold+1}...")
+        print_flush(f"    Fold {fold+1}...")
         X_t_train, X_u_train = torch.FloatTensor(latents[train_idx]), torch.FloatTensor(u_feat[train_idx])
         y_train = torch.FloatTensor(y_data[train_idx]).view(-1, 1)
         X_t_val, X_u_val = torch.FloatTensor(latents[val_idx]), torch.FloatTensor(u_feat[val_idx])
@@ -226,11 +226,46 @@ def train_and_get_residuals(latents, u_feat, y_data, task_type):
             residuals[val_idx] = y_data[val_idx] - model(X_t_val, X_u_val).numpy().flatten()
     return residuals
 
+def run_group_analysis(emb_g, u_feat_g, likes_g, comments_g, rob_replied_g, gender_g, group_name):
+    print_flush(f"\n--- Running Comprehensive Analysis for {group_name} ---")
+    ln_likes = np.log1p(likes_g)
+    ln_comments = np.log1p(comments_g)
+    female_rob = gender_g * rob_replied_g
+    
+    latents, vae_loss = train_vae(emb_g)
+    print_flush(f"  VAE Loss ({group_name}): {vae_loss:.4f}")
+    
+    print_flush(f"  Training residuals for {group_name}...")
+    res_likes = train_and_get_residuals(latents, u_feat_g, ln_likes, 'regression')
+    res_comments = train_and_get_residuals(latents, u_feat_g, ln_comments, 'regression')
+    res_rob = train_and_get_residuals(latents, u_feat_g, rob_replied_g, 'classification')
+    res_female = train_and_get_residuals(latents, u_feat_g, gender_g, 'classification')
+    res_female_rob = train_and_get_residuals(latents, u_feat_g, female_rob, 'regression')
+    
+    print_flush(f"  Estimating 6 Models for {group_name}...")
+    # Regressions
+    m1 = sm.OLS(res_likes, sm.add_constant(res_rob)).fit()
+    m2 = sm.OLS(res_likes, sm.add_constant(np.column_stack([res_rob, res_female_rob]))).fit()
+    m_add1 = sm.OLS(res_likes, sm.add_constant(res_female)).fit()
+    m_add2 = sm.OLS(res_likes, sm.add_constant(np.column_stack([res_female, res_female_rob]))).fit()
+    m_add3 = sm.OLS(res_comments, sm.add_constant(res_female)).fit()
+    m_add4 = sm.OLS(res_comments, sm.add_constant(np.column_stack([res_female, res_female_rob]))).fit()
+    
+    return {
+        "vae_loss": float(vae_loss),
+        "model1": {"coef": m1.params.tolist(), "pvalues": m1.pvalues.tolist(), "r2": m1.rsquared},
+        "model2": {"coef": m2.params.tolist(), "pvalues": m2.pvalues.tolist(), "r2": m2.rsquared},
+        "add_model1": {"coef": m_add1.params.tolist(), "pvalues": m_add1.pvalues.tolist(), "r2": m_add1.rsquared},
+        "add_model2": {"coef": m_add2.params.tolist(), "pvalues": m_add2.pvalues.tolist(), "r2": m_add2.rsquared},
+        "add_model3": {"coef": m_add3.params.tolist(), "pvalues": m_add3.pvalues.tolist(), "r2": m_add3.rsquared},
+        "add_model4": {"coef": m_add4.params.tolist(), "pvalues": m_add4.pvalues.tolist(), "r2": m_add4.rsquared}
+    }
+
 def run_dml_analysis():
     BASE_DIR = r"c:\Users\ge27tuv\Projects\Doubel-Machine-Learning"
     DATA_DIR = os.path.join(BASE_DIR, "Datasets")
     
-    emb, u_feat, likes, comments, rob_replied, gender, ids = load_and_align_full_data(
+    emb, u_feat, likes, comments, rob_replied, gender, p_dates, ids = load_and_align_full_data(
         os.path.join(DATA_DIR, "id_mapping_final.csv"),
         os.path.join(DATA_DIR, "Posts.json"),
         os.path.join(DATA_DIR, "Users.json"),
@@ -238,80 +273,32 @@ def run_dml_analysis():
         os.path.join(DATA_DIR, "embeddings_final.npy")
     )
     
-    ln_likes = np.log1p(likes)
-    ln_comments = np.log1p(comments)
-    female_rob = gender * rob_replied
+    # Sorting by post creation time for technology diffusion analysis
+    sort_idx = np.argsort(p_dates)
+    emb, u_feat, likes, comments = emb[sort_idx], u_feat[sort_idx], likes[sort_idx], comments[sort_idx]
+    rob_replied, gender = rob_replied[sort_idx], gender[sort_idx]
     
-    print_flush(f"Class Balance (RobReplied): {np.mean(rob_replied):.4f}")
-    print_flush(f"Total features per sample: {u_feat.shape[1]}")
+    n = len(sort_idx)
+    idx16 = int(n * 0.16)
+    idx50 = int(n * 0.50)
     
-    latents, vae_loss = train_vae(emb)
-    
-    # Base residuals
-    res_likes = train_and_get_residuals(latents, u_feat, ln_likes, 'regression')
-    res_comments = train_and_get_residuals(latents, u_feat, ln_comments, 'regression')
-    
-    # Treatment & interaction residuals
-    res_rob = train_and_get_residuals(latents, u_feat, rob_replied, 'classification')
-    res_female = train_and_get_residuals(latents, u_feat, gender, 'classification')
-    res_female_rob = train_and_get_residuals(latents, u_feat, female_rob, 'regression')
-    
-    print_flush("\n--- Final OLS Regressions ---")
-    
-    # Baseline Model 1
-    X1 = sm.add_constant(res_rob)
-    m1 = sm.OLS(res_likes, X1).fit()
-    print_flush("Model 1: res_ln_likes ~ res_RobReplied")
-    print_flush(m1.summary().as_text())
-    
-    # Baseline Model 2
-    X2 = sm.add_constant(np.column_stack([res_rob, res_female_rob]))
-    m2 = sm.OLS(res_likes, X2).fit()
-    print_flush("\nModel 2: res_ln_likes ~ res_RobReplied + res_female_RobReplied")
-    print_flush(m2.summary().as_text())
-    
-    # Additional Model 1: res_ln_likes ~ res_female
-    X_add1 = sm.add_constant(res_female)
-    m_add1 = sm.OLS(res_likes, X_add1).fit()
-    print_flush("\nAdd Model 1: res_ln_likes ~ res_female")
-    print_flush(m_add1.summary().as_text())
-    
-    # Additional Model 2: res_ln_likes ~ res_female + res_female_RobReplied
-    X_add2 = sm.add_constant(np.column_stack([res_female, res_female_rob]))
-    m_add2 = sm.OLS(res_likes, X_add2).fit()
-    print_flush("\nAdd Model 2: res_ln_likes ~ res_female + res_female_RobReplied")
-    print_flush(m_add2.summary().as_text())
-    
-    # Additional Model 3: res_ln_comments ~ res_female
-    X_add3 = sm.add_constant(res_female)
-    m_add3 = sm.OLS(res_comments, X_add3).fit()
-    print_flush("\nAdd Model 3: res_ln_comment_count ~ res_female")
-    print_flush(m_add3.summary().as_text())
-    
-    # Additional Model 4: res_ln_comments ~ res_female + res_female_RobReplied
-    X_add4 = sm.add_constant(np.column_stack([res_female, res_female_rob]))
-    m_add4 = sm.OLS(res_comments, X_add4).fit()
-    print_flush("\nAdd Model 4: res_ln_comment_count ~ res_female + res_female_RobReplied")
-    print_flush(m_add4.summary().as_text())
-    
-    results = {
-        "vae_loss": vae_loss,
-        "model1": {"coef": m1.params.tolist(), "pvalues": m1.pvalues.tolist(), "r2": m1.rsquared},
-        "model2": {"coef": m2.params.tolist(), "pvalues": m2.pvalues.tolist(), "r2": m2.rsquared},
-        "add_model1": {"coef": m_add1.params.tolist(), "pvalues": m_add1.pvalues.tolist(), "r2": m_add1.rsquared},
-        "add_model2": {"coef": m_add2.params.tolist(), "pvalues": m_add2.pvalues.tolist(), "r2": m_add2.rsquared},
-        "add_model3": {"coef": m_add3.params.tolist(), "pvalues": m_add3.pvalues.tolist(), "r2": m_add3.rsquared},
-        "add_model4": {"coef": m_add4.params.tolist(), "pvalues": m_add4.pvalues.tolist(), "r2": m_add4.rsquared},
-        "residuals": {
-            "res_likes": res_likes.tolist(), 
-            "res_comments": res_comments.tolist(),
-            "res_rob": res_rob.tolist(), 
-            "res_female": res_female.tolist(),
-            "res_female_rob": res_female_rob.tolist()
-        }
+    groups = {
+        "group1": (0, idx16),
+        "group2": (idx16, idx50),
+        "group3": (idx50, n)
     }
-    with open(os.path.join(BASE_DIR, "dml_full_results.json"), "w") as f:
-        json.dump(results, f)
+    
+    diffusion_results = {}
+    for g_name, (start, end) in groups.items():
+        res = run_group_analysis(
+            emb[start:end], u_feat[start:end], likes[start:end], 
+            comments[start:end], rob_replied[start:end], gender[start:end], g_name
+        )
+        diffusion_results[g_name] = res
+        
+    with open(os.path.join(BASE_DIR, "dml_diffusion_results.json"), "w") as f:
+        json.dump(diffusion_results, f, indent=4)
+    print_flush("\nUnified Technology Diffusion Results (6 models per group) saved to dml_diffusion_results.json")
 
 if __name__ == "__main__":
     run_dml_analysis()
